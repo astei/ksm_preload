@@ -29,10 +29,9 @@
 #include <sys/syscall.h>        // SYS_mmap, SYS_mmap2
 
 #include <assert.h>
-#include <error.h>
+#include <err.h>
 #include <errno.h>
 #include <limits.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>              // fprintf(), stderr
@@ -51,12 +50,6 @@ static const char *const MERGE_THRESHOLD_ENV_NAME = "KSMP_MERGE_THRESHOLD";
 # define MMAP2_ENABLED 0
 #endif
 
-#ifdef GCC
-# define likely(x)      __builtin_expect((x),1)
-#else
-# define likely(x)      (x)
-#endif
-
 
 
 /******** GLOBAL STATE ********/
@@ -73,12 +66,6 @@ typedef void *mmap2_function (void *start, size_t length, int prot, int flags,
 typedef void *mremap_function (void *old_address, size_t old_length,
                                size_t new_length, int flags, ...);
 typedef void *realloc_function (void *addr, size_t size);
-
-/* Declares the libc version of the functions we hook */
-extern calloc_function __libc_calloc;
-extern malloc_function __libc_malloc;
-extern realloc_function __libc_realloc;
-extern void __libc_free (void *ptr);
 
 /* Directly calls the mmap() syscall */
 static void *
@@ -111,8 +98,9 @@ kernel_mmap2 (void *start, size_t length, int prot, int flags,
 static void *
 kernel_mmap2 ()
 {
-  error (1, 0, "ksm_preload: Fatal error: mmap2 was called but not"
-         " exported. Please contact unbrice@vleu.net .");
+  fprintf (stderr, "ksm_preload: Fatal error: mmap2 was called but not"
+         " exported. Please contact unbrice@vleu.net.");
+  errno = ENOSYS;
   return NULL;
 }
 #endif
@@ -120,9 +108,7 @@ kernel_mmap2 ()
 /* This structure contains all global variables. */
 static struct
 {
-  /* The functions that the program would be using if we weren't preloaded.
-   * Temporarily set to "safe" values during initialisation
-   */
+  /* The functions that the program would be using if we weren't preloaded. */
   calloc_function *ext_calloc;
   malloc_function *ext_malloc;
   mmap_function *ext_mmap;
@@ -137,22 +123,15 @@ static struct
   int merge_threshold;
 } globals =
 {
-#if __GLIBC_PREREQ(2,11) || KSMP_FORCE_LIBC
-  __libc_calloc,                // libc's calloc
-  __libc_malloc,		// libc's malloc
-  kernel_mmap,			// calls kernel's mmap
-  kernel_mmap2,			// calls kernel's mmap2, fails if undefined
-  NULL,				// mremap, unused during initialisation
-  __libc_realloc,		// libc realloc
-#else
-#error This version of ksm_preload has not been tested with your	\
-  libC. Please define KSMP_FORCE_LIBC to 1 (-DKSMP_FORCE_LIBC=1) and	\
-  tell me about the result.
-#endif
+  NULL,
+  NULL,
+  kernel_mmap,
+  kernel_mmap2,
+  NULL,
+  NULL,
   4096,				// page_size
     4096 * 8			// merge threshold
 };
-
 
 
 /******** SETUP ********/
@@ -237,7 +216,7 @@ xdlsym (void *handle, const char *symbol)
     return res;
   else
     {
-      error (1, 0, "failed to load %s : %s", symbol, dlerror ());
+      fprintf (stderr, "failed to load %s: %s", symbol, dlerror ());
       return NULL;
     }
 }
@@ -283,35 +262,18 @@ setup ()
 
   debug_puts ("Setup done.");
 }
-
+
+
 
 /******** UTILITIES FOR WRAPPERS ********/
 
 static void
 lazily_setup ()
 {
-  /* Allows to be sure that only one thread is calling setup() */
-  static pthread_mutex_t mutex = PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP;
-  /* True if setup() has been called and returned */
-  static bool setup_done = false;
-
-  /* Quickly returns if the job was already done */
-  __sync_synchronize ();	// updates globals.* variables
-  if (likely (setup_done))
-    return;
-
-  // <mutex>
-  if (pthread_mutex_lock (&mutex) == EDEADLK)
-    return;			// Recursive call
-
-  if (!setup_done)		// Might have been called since last check
+  if (globals.ext_malloc == NULL)
     {
-      setup ();
-      setup_done = true;
+      setup();
     }
-
-  // </mutex>
-  pthread_mutex_unlock (&mutex);
 }
 
 /* Issues a madvise(..., MADV_MERGEABLE) if len is big enough and flags are rights.
@@ -320,7 +282,6 @@ lazily_setup ()
 static void
 merge_if_profitable (void *address, size_t length, int flags)
 {
-
   /* Rounds address to its page */
   const uintptr_t raw_address = (uintptr_t) address;
   const uintptr_t page_address =
@@ -346,7 +307,8 @@ merge_if_profitable (void *address, size_t length, int flags)
   else
     debug_puts ("Not sharing (flags filtered)");
 }
-
+
+
 
 /******** WRAPPERS ********/
 
